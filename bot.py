@@ -3,8 +3,8 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Optional
 
+import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -14,68 +14,66 @@ from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto
 )
-from dotenv import load_dotenv
-from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, Text, ForeignKey, func, select
-)
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base, relationship
 
-# Загрузка переменных окружения
-load_dotenv()
+# === Конфигурация из переменных окружения ===
 API_TOKEN = os.getenv('API_TOKEN')
-MANAGER_ID = int(os.getenv('MANAGER_ID', 0))
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite+aiosqlite:///bot.db')
+MANAGER_ID = os.getenv('MANAGER_ID')
+if MANAGER_ID:
+    MANAGER_ID = int(MANAGER_ID)
+else:
+    MANAGER_ID = None
 
-# Настройка базы данных
-engine = create_async_engine(DATABASE_URL, echo=True)
-AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-Base = declarative_base()
+DATABASE_PATH = 'bot.db'
 
-# Модели данных
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, nullable=False)
-    username = Column(String, nullable=True)
-    full_name = Column(String, nullable=True)
-    phone = Column(String, nullable=True)
-    address = Column(String, nullable=True)
-    septic_type = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_interaction = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    utm_source = Column(String, nullable=True)
-    utm_medium = Column(String, nullable=True)
-    utm_campaign = Column(String, nullable=True)
-    utm_term = Column(String, nullable=True)
-    utm_content = Column(String, nullable=True)
-    leads = relationship("Lead", back_populates="user")
-
-class Lead(Base):
-    __tablename__ = 'leads'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    service_type = Column(String, nullable=False)
-    address = Column(String, nullable=True)
-    septic_type = Column(String, nullable=True)
-    status = Column(String, default='новый')
-    created_at = Column(DateTime, default=datetime.utcnow)
-    assigned_manager = Column(Integer, nullable=True)
-    user = relationship("User", back_populates="leads")
-
-class Log(Base):
-    __tablename__ = 'logs'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    action = Column(String)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-# Инициализация базы данных
+# === Инициализация базы данных ===
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Таблица пользователей
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                address TEXT,
+                septic_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                utm_source TEXT,
+                utm_medium TEXT,
+                utm_campaign TEXT,
+                utm_term TEXT,
+                utm_content TEXT
+            )
+        ''')
+        # Таблица заявок
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                service_type TEXT NOT NULL,
+                address TEXT,
+                septic_type TEXT,
+                status TEXT DEFAULT 'новый',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                assigned_manager INTEGER,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
+        # Таблица логов (опционально)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
+        await db.commit()
 
-# Состояния FSM
+# === Состояния FSM ===
 class SepticTankStates(StatesGroup):
     choosing_service = State()
     entering_address = State()
@@ -84,7 +82,7 @@ class SepticTankStates(StatesGroup):
     broadcast_message = State()
     broadcast_confirm = State()
 
-# Клавиатуры
+# === Клавиатуры ===
 service_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🚛 Срочная откачка")],
@@ -102,7 +100,7 @@ phone_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Вспомогательные функции
+# === Вспомогательные функции ===
 def parse_utm_start(payload: str) -> dict:
     utm = {}
     if payload:
@@ -132,13 +130,12 @@ async def notify_manager(bot: Bot, lead_data: dict):
     )
     await bot.send_message(chat_id=MANAGER_ID, text=text)
 
-# Создаём роутер и диспетчер
+# === Роутер и диспетчер ===
 router = Router()
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
-# ----- Обработчики -----
-
+# === Обработчики ===
 @router.message(CommandStart(deep_link=True))
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -146,28 +143,45 @@ async def cmd_start(message: Message, state: FSMContext):
     payload = args[1] if len(args) > 1 else ""
     utm = parse_utm_start(payload)
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
-        user = result.scalar_one_or_none()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('SELECT id FROM users WHERE telegram_id = ?', (message.from_user.id,))
+        user = await cursor.fetchone()
         if not user:
-            user = User(
-                telegram_id=message.from_user.id,
-                username=message.from_user.username,
-                full_name=message.from_user.full_name,
-                utm_source=utm.get('utm_source'),
-                utm_medium=utm.get('utm_medium'),
-                utm_campaign=utm.get('utm_campaign'),
-                utm_term=utm.get('utm_term'),
-                utm_content=utm.get('utm_content')
-            )
-            session.add(user)
-            await session.commit()
+            await db.execute('''
+                INSERT INTO users 
+                (telegram_id, username, full_name, utm_source, utm_medium, utm_campaign, utm_term, utm_content)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.full_name,
+                utm.get('utm_source'),
+                utm.get('utm_medium'),
+                utm.get('utm_campaign'),
+                utm.get('utm_term'),
+                utm.get('utm_content')
+            ))
         else:
-            # обновляем UTM, если пришли новые
-            if utm.get('utm_source'):
-                user.utm_source = utm['utm_source']
-            # аналогично для других
-            await session.commit()
+            # Обновляем UTM, если пришли новые
+            if utm:
+                await db.execute('''
+                    UPDATE users SET
+                        utm_source = COALESCE(?, utm_source),
+                        utm_medium = COALESCE(?, utm_medium),
+                        utm_campaign = COALESCE(?, utm_campaign),
+                        utm_term = COALESCE(?, utm_term),
+                        utm_content = COALESCE(?, utm_content),
+                        last_interaction = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                ''', (
+                    utm.get('utm_source'),
+                    utm.get('utm_medium'),
+                    utm.get('utm_campaign'),
+                    utm.get('utm_term'),
+                    utm.get('utm_content'),
+                    message.from_user.id
+                ))
+        await db.commit()
 
     await message.answer(
         "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
@@ -265,23 +279,36 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     address = data.get('address')
     septic_type = data.get('septic_type')
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
-        user = result.scalar_one()
-        user.phone = phone
-        user.address = address
-        user.septic_type = septic_type
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('SELECT id, utm_source, utm_medium, utm_campaign FROM users WHERE telegram_id = ?', (message.from_user.id,))
+        user = await cursor.fetchone()
+        if not user:
+            # На случай если пользователя нет (хотя должен быть)
+            await db.execute('''
+                INSERT INTO users (telegram_id, username, full_name, phone, address, septic_type)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (message.from_user.id, message.from_user.username, message.from_user.full_name, phone, address, septic_type))
+            await db.commit()
+            cursor = await db.execute('SELECT last_insert_rowid()')
+            user_id = (await cursor.fetchone())[0]
+            utm_source = utm_medium = utm_campaign = None
+        else:
+            user_id = user[0]
+            utm_source = user[1]
+            utm_medium = user[2]
+            utm_campaign = user[3]
+            # Обновляем данные пользователя
+            await db.execute('''
+                UPDATE users SET phone = ?, address = ?, septic_type = ?, last_interaction = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+            ''', (phone, address, septic_type, message.from_user.id))
 
-        lead = Lead(
-            user_id=user.id,
-            service_type=service_type,
-            address=address,
-            septic_type=septic_type,
-            status='новый'
-        )
-        session.add(lead)
-        await session.commit()
-        lead_id = lead.id
+        # Создаём заявку
+        await db.execute('''
+            INSERT INTO leads (user_id, service_type, address, septic_type, status)
+            VALUES (?, ?, ?, ?, 'новый')
+        ''', (user_id, service_type, address, septic_type))
+        await db.commit()
 
     lead_data = {
         'service_type': service_type,
@@ -289,7 +316,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
         'phone': phone,
         'address': address,
         'septic_type': septic_type,
-        'utm': f"source={user.utm_source}, medium={user.utm_medium}, campaign={user.utm_campaign}"
+        'utm': f"source={utm_source}, medium={utm_medium}, campaign={utm_campaign}"
     }
     await notify_manager(message.bot, lead_data)
 
@@ -299,9 +326,9 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     )
     await state.clear()
 
-# ----- Админские команды (доступны только MANAGER_ID) -----
+# === Админские команды ===
 async def is_admin(message: Message) -> bool:
-    return message.from_user.id == MANAGER_ID
+    return MANAGER_ID is not None and message.from_user.id == MANAGER_ID
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -310,17 +337,24 @@ async def cmd_stats(message: Message):
     today = datetime.utcnow().date()
     week_ago = today - timedelta(days=7)
 
-    async with AsyncSessionLocal() as session:
-        total_users = await session.scalar(select(func.count(User.id)))
-        leads_today = await session.scalar(
-            select(func.count(Lead.id)).where(func.date(Lead.created_at) == today)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('SELECT COUNT(*) FROM users')
+        total_users = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            'SELECT COUNT(*) FROM leads WHERE date(created_at) = date(?)',
+            (today.isoformat(),)
         )
-        leads_week = await session.scalar(
-            select(func.count(Lead.id)).where(Lead.created_at >= week_ago)
+        leads_today = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            'SELECT COUNT(*) FROM leads WHERE created_at >= ?',
+            (week_ago.isoformat(),)
         )
-        users_with_leads = await session.scalar(
-            select(func.count(func.distinct(Lead.user_id)))
-        )
+        leads_week = (await cursor.fetchone())[0]
+
+        cursor = await db.execute('SELECT COUNT(DISTINCT user_id) FROM leads')
+        users_with_leads = (await cursor.fetchone())[0]
 
     text = (
         f"📊 Статистика:\n"
@@ -335,11 +369,12 @@ async def cmd_stats(message: Message):
 async def cmd_get_leads(message: Message):
     if not await is_admin(message):
         return
-    async with AsyncSessionLocal() as session:
-        leads = await session.execute(
-            select(Lead).order_by(Lead.created_at.desc()).limit(10)
-        )
-        leads = leads.scalars().all()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            SELECT id, service_type, status, created_at FROM leads
+            ORDER BY created_at DESC LIMIT 10
+        ''')
+        leads = await cursor.fetchall()
 
     if not leads:
         await message.answer("Нет заявок.")
@@ -347,7 +382,9 @@ async def cmd_get_leads(message: Message):
 
     text = "Последние 10 заявок:\n"
     for lead in leads:
-        text += f"#{lead.id} {lead.service_type} - {lead.status} ({lead.created_at.strftime('%d.%m %H:%M')})\n"
+        lead_id, service_type, status, created_at = lead
+        dt = datetime.fromisoformat(created_at).strftime('%d.%m %H:%M')
+        text += f"#{lead_id} {service_type} - {status} ({dt})\n"
     await message.answer(text)
 
 @router.message(Command("lead"))
@@ -364,23 +401,33 @@ async def cmd_lead(message: Message, command: CommandObject):
         await message.answer("Неверный формат ID.")
         return
 
-    async with AsyncSessionLocal() as session:
-        lead = await session.get(Lead, lead_id)
-        if not lead:
-            await message.answer("Заявка не найдена.")
-            return
-        user = await session.get(User, lead.user_id)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('''
+            SELECT l.id, l.service_type, l.status, l.created_at, l.address, l.septic_type,
+                   u.full_name, u.username, u.phone, u.utm_source, u.utm_medium, u.utm_campaign
+            FROM leads l
+            JOIN users u ON l.user_id = u.id
+            WHERE l.id = ?
+        ''', (lead_id,))
+        lead = await cursor.fetchone()
+
+    if not lead:
+        await message.answer("Заявка не найдена.")
+        return
+
+    (lead_id, service_type, status, created_at, address, septic_type,
+     full_name, username, phone, utm_source, utm_medium, utm_campaign) = lead
 
     text = (
-        f"📋 Заявка #{lead.id}\n"
-        f"Услуга: {lead.service_type}\n"
-        f"Статус: {lead.status}\n"
-        f"Дата: {lead.created_at}\n"
-        f"Клиент: {user.full_name} (@{user.username})\n"
-        f"Телефон: {user.phone}\n"
-        f"Адрес: {lead.address}\n"
-        f"Септик: {lead.septic_type or 'не указан'}\n"
-        f"UTM: {user.utm_source} / {user.utm_medium} / {user.utm_campaign}"
+        f"📋 Заявка #{lead_id}\n"
+        f"Услуга: {service_type}\n"
+        f"Статус: {status}\n"
+        f"Дата: {created_at}\n"
+        f"Клиент: {full_name} (@{username})\n"
+        f"Телефон: {phone}\n"
+        f"Адрес: {address}\n"
+        f"Септик: {septic_type or 'не указан'}\n"
+        f"UTM: {utm_source} / {utm_medium} / {utm_campaign}"
     )
     await message.answer(text)
 
@@ -388,7 +435,7 @@ async def cmd_lead(message: Message, command: CommandObject):
 async def cmd_broadcast(message: Message, state: FSMContext):
     if not await is_admin(message):
         return
-    await message.answer("Введите сообщение для рассылки (можно с медиа, но пока только текст):")
+    await message.answer("Введите сообщение для рассылки (только текст):")
     await state.set_state(SepticTankStates.broadcast_message)
 
 @router.message(SepticTankStates.broadcast_message)
@@ -415,9 +462,9 @@ async def broadcast_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     text = data.get('broadcast_text')
 
-    async with AsyncSessionLocal() as session:
-        users = await session.execute(select(User.telegram_id))
-        user_ids = [row[0] for row in users]
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute('SELECT telegram_id FROM users')
+        user_ids = [row[0] for row in await cursor.fetchall()]
 
     await callback.message.edit_text(f"Начинаю рассылку {len(user_ids)} пользователям...")
 
@@ -443,10 +490,12 @@ async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Рассылка отменена.")
     await state.clear()
 
-# ----- Запуск бота -----
+# === Запуск бота ===
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
+    if not API_TOKEN:
+        raise ValueError("Не задан API_TOKEN в переменных окружения")
     bot = Bot(token=API_TOKEN)
     await dp.start_polling(bot)
 
