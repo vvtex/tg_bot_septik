@@ -61,7 +61,7 @@ async def init_db():
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )
         ''')
-        # Таблица логов (опционально)
+        # Таблица логов
         await db.execute('''
             CREATE TABLE IF NOT EXISTS logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,22 +83,38 @@ class SepticTankStates(StatesGroup):
     broadcast_confirm = State()
 
 # === Клавиатуры ===
-service_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🚛 Срочная откачка")],
-        [KeyboardButton(text="🔧 Ремонт оборудования")],
-        [KeyboardButton(text="🏡 Монтаж нового септика")],
-        [KeyboardButton(text="❓ Не знаю, нужна диагностика")]
-    ],
-    resize_keyboard=True
-)
+def get_service_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚛 Срочная откачка")],
+            [KeyboardButton(text="🔧 Ремонт оборудования")],
+            [KeyboardButton(text="🏡 Монтаж нового септика")],
+            [KeyboardButton(text="❓ Не знаю, нужна диагностика")]
+        ],
+        resize_keyboard=True
+    )
 
-phone_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📞 Отправить контакт", request_contact=True)]
-    ],
-    resize_keyboard=True
-)
+def get_phone_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📞 Отправить контакт", request_contact=True)]
+        ],
+        resize_keyboard=True
+    )
+
+def get_menu_inline_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu")]
+        ]
+    )
+
+def get_after_request_inline_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Оставить ещё заявку", callback_data="menu")]
+        ]
+    )
 
 # === Вспомогательные функции ===
 def parse_utm_start(payload: str) -> dict:
@@ -116,6 +132,11 @@ def validate_phone(phone: str) -> bool:
     digits = re.sub(r'\D', '', phone)
     return len(digits) >= 10
 
+async def log_action(user_id: int, action: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute('INSERT INTO logs (user_id, action) VALUES (?, ?)', (user_id, action))
+        await db.commit()
+
 async def notify_manager(bot: Bot, lead_data: dict):
     if not MANAGER_ID:
         return
@@ -130,12 +151,44 @@ async def notify_manager(bot: Bot, lead_data: dict):
     )
     await bot.send_message(chat_id=MANAGER_ID, text=text)
 
+# === Функция возврата в главное меню ===
+async def back_to_menu(message: Message, state: FSMContext, edit: bool = False):
+    """Возвращает пользователя в меню выбора услуги"""
+    await state.clear()
+    await state.set_state(SepticTankStates.choosing_service)
+    if edit:
+        await message.edit_text(
+            "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
+            "Выберите, что именно нужно:",
+            reply_markup=get_service_keyboard()
+        )
+    else:
+        await message.answer(
+            "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
+            "Выберите, что именно нужно:",
+            reply_markup=get_service_keyboard()
+        )
+    await log_action(message.from_user.id, 'back_to_menu')
+
 # === Роутер и диспетчер ===
 router = Router()
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
 # === Обработчики ===
+
+# Команда /menu и /cancel
+@router.message(Command("menu"))
+@router.message(Command("cancel"))
+async def cmd_menu(message: Message, state: FSMContext):
+    await back_to_menu(message, state)
+
+# Обработчик inline-кнопки "В главное меню"
+@router.callback_query(F.data == "menu")
+async def callback_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await back_to_menu(callback.message, state, edit=True)
+
 @router.message(CommandStart(deep_link=True))
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -161,6 +214,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 utm.get('utm_term'),
                 utm.get('utm_content')
             ))
+            await log_action(message.from_user.id, 'start_new_user')
         else:
             # Обновляем UTM, если пришли новые
             if utm:
@@ -181,12 +235,13 @@ async def cmd_start(message: Message, state: FSMContext):
                     utm.get('utm_content'),
                     message.from_user.id
                 ))
+            await log_action(message.from_user.id, 'start_existing_user')
         await db.commit()
 
     await message.answer(
         "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
         "Выберите, что именно нужно:",
-        reply_markup=service_keyboard
+        reply_markup=get_service_keyboard()
     )
     await state.set_state(SepticTankStates.choosing_service)
 
@@ -194,6 +249,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def service_chosen(message: Message, state: FSMContext):
     service = message.text
     await state.update_data(service_type=service)
+    await log_action(message.from_user.id, f'chose_service:{service}')
 
     expert_text = (
         "🔍 Как понять, что пора откачивать септик?\n"
@@ -204,17 +260,23 @@ async def service_chosen(message: Message, state: FSMContext):
     )
     await message.answer(expert_text)
 
-    await message.answer("Укажите, пожалуйста, адрес объекта (город, улица, дом):")
+    await message.answer(
+        "Укажите, пожалуйста, адрес объекта (город, улица, дом):",
+        reply_markup=get_menu_inline_keyboard()
+    )
     await state.set_state(SepticTankStates.entering_address)
 
 @router.message(SepticTankStates.entering_address)
 async def address_entered(message: Message, state: FSMContext):
     address = message.text
     await state.update_data(address=address)
+    await log_action(message.from_user.id, f'entered_address:{address}')
 
     await message.answer(
         "Если знаете марку или тип септика (например, Танк, Топас, Юнилос), напишите. "
-        "Если нет, просто нажмите /skip или отправьте прочерк."
+        "Если нет, просто нажмите /skip или отправьте прочерк.\n\n"
+        "Вы также можете вернуться в меню с помощью кнопки ниже.",
+        reply_markup=get_menu_inline_keyboard()
     )
     await state.set_state(SepticTankStates.entering_septic_type)
 
@@ -223,8 +285,10 @@ async def septic_type_entered(message: Message, state: FSMContext):
     septic = message.text
     if septic and septic not in ['/skip', '-']:
         await state.update_data(septic_type=septic)
+        await log_action(message.from_user.id, f'entered_septic:{septic}')
     else:
         await state.update_data(septic_type=None)
+        await log_action(message.from_user.id, 'skipped_septic')
 
     # Демонстрация ценности
     pdf_path = "media/price.pdf"
@@ -252,8 +316,8 @@ async def septic_type_entered(message: Message, state: FSMContext):
     await message.answer(benefits)
 
     await message.answer(
-        "Готовы вызвать мастера для осмотра/откачки?",
-        reply_markup=phone_keyboard
+        "Готовы вызвать мастера для осмотра/откачки? Нажмите кнопку ниже, чтобы отправить контакт.",
+        reply_markup=get_phone_keyboard()
     )
     await state.set_state(SepticTankStates.confirming_phone)
 
@@ -270,7 +334,7 @@ async def phone_received_text(message: Message, state: FSMContext):
     else:
         await message.answer(
             "Номер телефона некорректен. Пожалуйста, введите номер в формате +7XXXXXXXXXX или нажмите кнопку 'Отправить контакт'",
-            reply_markup=phone_keyboard
+            reply_markup=get_phone_keyboard()
         )
 
 async def process_phone(message: Message, state: FSMContext, phone: str):
@@ -283,7 +347,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
         cursor = await db.execute('SELECT id, utm_source, utm_medium, utm_campaign FROM users WHERE telegram_id = ?', (message.from_user.id,))
         user = await cursor.fetchone()
         if not user:
-            # На случай если пользователя нет (хотя должен быть)
+            # Создаём пользователя, если его нет (на всякий случай)
             await db.execute('''
                 INSERT INTO users (telegram_id, username, full_name, phone, address, septic_type)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -309,6 +373,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
             VALUES (?, ?, ?, ?, 'новый')
         ''', (user_id, service_type, address, septic_type))
         await db.commit()
+        await log_action(message.from_user.id, f'lead_created:{service_type}')
 
     lead_data = {
         'service_type': service_type,
@@ -320,13 +385,15 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     }
     await notify_manager(message.bot, lead_data)
 
+    # Финальное сообщение с возможностью начать новую заявку
     await message.answer(
-        f"Спасибо, {message.from_user.first_name}! Ваша заявка принята. Менеджер свяжется с вами в течение 5-10 минут.",
-        reply_markup=None
+        f"✅ Спасибо, {message.from_user.first_name}! Ваша заявка принята и передана менеджеру.\n"
+        f"Данные сохранены в нашей системе. Менеджер свяжется с вами в течение 5-10 минут.",
+        reply_markup=get_after_request_inline_keyboard()
     )
     await state.clear()
 
-# === Админские команды ===
+# === Админские команды (без изменений) ===
 async def is_admin(message: Message) -> bool:
     return MANAGER_ID is not None and message.from_user.id == MANAGER_ID
 
