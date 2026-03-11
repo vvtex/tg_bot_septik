@@ -22,7 +22,7 @@ if MANAGER_ID:
     MANAGER_ID = int(MANAGER_ID)
 
 DATABASE_PATH = 'bot.db'
-db_lock = asyncio.Lock()  # Глобальная блокировка для доступа к БД
+db_lock = asyncio.Lock()
 
 # === Инициализация БД ===
 async def init_db():
@@ -99,13 +99,6 @@ def get_phone_keyboard():
         resize_keyboard=True
     )
 
-def get_menu_inline_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu")]
-        ]
-    )
-
 def get_after_request_inline_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -143,23 +136,19 @@ async def notify_manager(bot: Bot, lead_data: dict):
     )
     await bot.send_message(chat_id=MANAGER_ID, text=text)
 
-# === Возврат в меню ===
+# === Возврат в меню (сброс) ===
 async def back_to_menu(message: Message, state: FSMContext, edit: bool = False):
     await state.clear()
     await state.set_state(SepticTankStates.choosing_service)
+    text = (
+        "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
+        "Выберите, что именно нужно:"
+    )
     if edit:
-        await message.edit_text(
-            "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
-            "Выберите, что именно нужно:",
-            reply_markup=get_service_keyboard()
-        )
+        await message.edit_text(text, reply_markup=get_service_keyboard())
     else:
-        await message.answer(
-            "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
-            "Выберите, что именно нужно:",
-            reply_markup=get_service_keyboard()
-        )
-    # Логируем действие (используем блокировку)
+        await message.answer(text, reply_markup=get_service_keyboard())
+    # Логируем сброс
     async with db_lock:
         async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
@@ -173,7 +162,7 @@ router = Router()
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
-# === Обработчики ===
+# === Обработчики команд сброса ===
 @router.message(Command("menu"))
 @router.message(Command("cancel"))
 async def cmd_menu(message: Message, state: FSMContext):
@@ -184,6 +173,7 @@ async def callback_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await back_to_menu(callback.message, state, edit=True)
 
+# === Старт ===
 @router.message(CommandStart(deep_link=True))
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -239,13 +229,9 @@ async def cmd_start(message: Message, state: FSMContext):
                 )
             await db.commit()
 
-    await message.answer(
-        "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
-        "Выберите, что именно нужно:",
-        reply_markup=get_service_keyboard()
-    )
-    await state.set_state(SepticTankStates.choosing_service)
+    await back_to_menu(message, state)  # сразу показываем меню
 
+# === Выбор услуги ===
 @router.message(SepticTankStates.choosing_service, F.text.in_(["🚛 Срочная откачка", "🔧 Ремонт оборудования", "🏡 Монтаж нового септика", "❓ Не знаю, нужна диагностика"]))
 async def service_chosen(message: Message, state: FSMContext):
     service = message.text
@@ -269,11 +255,12 @@ async def service_chosen(message: Message, state: FSMContext):
     await message.answer(expert_text)
 
     await message.answer(
-        "Укажите, пожалуйста, адрес объекта (город, улица, дом):",
-        reply_markup=get_menu_inline_keyboard()
+        "Укажите, пожалуйста, адрес объекта (город, улица, дом).\n"
+        "Если хотите отменить заполнение, отправьте /cancel"
     )
     await state.set_state(SepticTankStates.entering_address)
 
+# === Ввод адреса ===
 @router.message(SepticTankStates.entering_address)
 async def address_entered(message: Message, state: FSMContext):
     address = message.text
@@ -290,11 +277,11 @@ async def address_entered(message: Message, state: FSMContext):
     await message.answer(
         "Если знаете марку или тип септика (например, Танк, Топас, Юнилос), напишите. "
         "Если нет, просто нажмите /skip или отправьте прочерк.\n\n"
-        "Вы также можете вернуться в меню с помощью кнопки ниже.",
-        reply_markup=get_menu_inline_keyboard()
+        "Для отмены используйте /cancel"
     )
     await state.set_state(SepticTankStates.entering_septic_type)
 
+# === Ввод типа септика ===
 @router.message(SepticTankStates.entering_septic_type)
 async def septic_type_entered(message: Message, state: FSMContext):
     septic = message.text
@@ -344,6 +331,7 @@ async def septic_type_entered(message: Message, state: FSMContext):
     )
     await state.set_state(SepticTankStates.confirming_phone)
 
+# === Получение контакта ===
 @router.message(SepticTankStates.confirming_phone, F.contact)
 async def phone_received_contact(message: Message, state: FSMContext):
     phone = message.contact.phone_number
@@ -371,7 +359,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
             cursor = await db.execute('SELECT id, utm_source, utm_medium, utm_campaign FROM users WHERE telegram_id = ?', (message.from_user.id,))
             user = await cursor.fetchone()
             if not user:
-                # Создаём пользователя, если его нет (на всякий случай)
+                # На случай если пользователя нет (хотя должен быть)
                 await db.execute('''
                     INSERT INTO users (telegram_id, username, full_name, phone, address, septic_type)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -420,7 +408,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     )
     await state.clear()
 
-# === Админские команды (без изменений, но тоже используют db_lock) ===
+# === Админские команды ===
 async def is_admin(message: Message) -> bool:
     return MANAGER_ID is not None and message.from_user.id == MANAGER_ID
 
@@ -528,6 +516,7 @@ async def cmd_lead(message: Message, command: CommandObject):
     )
     await message.answer(text)
 
+# === Рассылка (broadcast) ===
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message, state: FSMContext):
     if not await is_admin(message):
