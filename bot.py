@@ -15,63 +15,60 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto
 )
 
-# === Конфигурация из переменных окружения ===
+# === Конфигурация ===
 API_TOKEN = os.getenv('API_TOKEN')
 MANAGER_ID = os.getenv('MANAGER_ID')
 if MANAGER_ID:
     MANAGER_ID = int(MANAGER_ID)
-else:
-    MANAGER_ID = None
 
 DATABASE_PATH = 'bot.db'
+db_lock = asyncio.Lock()  # Глобальная блокировка для доступа к БД
 
-# === Инициализация базы данных ===
+# === Инициализация БД ===
 async def init_db():
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Таблица пользователей
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE NOT NULL,
-                username TEXT,
-                full_name TEXT,
-                phone TEXT,
-                address TEXT,
-                septic_type TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                utm_source TEXT,
-                utm_medium TEXT,
-                utm_campaign TEXT,
-                utm_term TEXT,
-                utm_content TEXT
-            )
-        ''')
-        # Таблица заявок
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS leads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                service_type TEXT NOT NULL,
-                address TEXT,
-                septic_type TEXT,
-                status TEXT DEFAULT 'новый',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                assigned_manager INTEGER,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        # Таблица логов
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                action TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        await db.commit()
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE NOT NULL,
+                    username TEXT,
+                    full_name TEXT,
+                    phone TEXT,
+                    address TEXT,
+                    septic_type TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    utm_source TEXT,
+                    utm_medium TEXT,
+                    utm_campaign TEXT,
+                    utm_term TEXT,
+                    utm_content TEXT
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    service_type TEXT NOT NULL,
+                    address TEXT,
+                    septic_type TEXT,
+                    status TEXT DEFAULT 'новый',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    assigned_manager INTEGER,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            ''')
+            await db.commit()
 
 # === Состояния FSM ===
 class SepticTankStates(StatesGroup):
@@ -132,11 +129,6 @@ def validate_phone(phone: str) -> bool:
     digits = re.sub(r'\D', '', phone)
     return len(digits) >= 10
 
-async def log_action(user_id: int, action: str):
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute('INSERT INTO logs (user_id, action) VALUES (?, ?)', (user_id, action))
-        await db.commit()
-
 async def notify_manager(bot: Bot, lead_data: dict):
     if not MANAGER_ID:
         return
@@ -151,9 +143,8 @@ async def notify_manager(bot: Bot, lead_data: dict):
     )
     await bot.send_message(chat_id=MANAGER_ID, text=text)
 
-# === Функция возврата в главное меню ===
+# === Возврат в меню ===
 async def back_to_menu(message: Message, state: FSMContext, edit: bool = False):
-    """Возвращает пользователя в меню выбора услуги"""
     await state.clear()
     await state.set_state(SepticTankStates.choosing_service)
     if edit:
@@ -168,7 +159,14 @@ async def back_to_menu(message: Message, state: FSMContext, edit: bool = False):
             "Выберите, что именно нужно:",
             reply_markup=get_service_keyboard()
         )
-    await log_action(message.from_user.id, 'back_to_menu')
+    # Логируем действие (используем блокировку)
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                (message.from_user.id, 'back_to_menu')
+            )
+            await db.commit()
 
 # === Роутер и диспетчер ===
 router = Router()
@@ -176,14 +174,11 @@ dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
 # === Обработчики ===
-
-# Команда /menu и /cancel
 @router.message(Command("menu"))
 @router.message(Command("cancel"))
 async def cmd_menu(message: Message, state: FSMContext):
     await back_to_menu(message, state)
 
-# Обработчик inline-кнопки "В главное меню"
 @router.callback_query(F.data == "menu")
 async def callback_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -196,47 +191,53 @@ async def cmd_start(message: Message, state: FSMContext):
     payload = args[1] if len(args) > 1 else ""
     utm = parse_utm_start(payload)
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('SELECT id FROM users WHERE telegram_id = ?', (message.from_user.id,))
-        user = await cursor.fetchone()
-        if not user:
-            await db.execute('''
-                INSERT INTO users 
-                (telegram_id, username, full_name, utm_source, utm_medium, utm_campaign, utm_term, utm_content)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                message.from_user.id,
-                message.from_user.username,
-                message.from_user.full_name,
-                utm.get('utm_source'),
-                utm.get('utm_medium'),
-                utm.get('utm_campaign'),
-                utm.get('utm_term'),
-                utm.get('utm_content')
-            ))
-            await log_action(message.from_user.id, 'start_new_user')
-        else:
-            # Обновляем UTM, если пришли новые
-            if utm:
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('SELECT id FROM users WHERE telegram_id = ?', (message.from_user.id,))
+            user = await cursor.fetchone()
+            if not user:
                 await db.execute('''
-                    UPDATE users SET
-                        utm_source = COALESCE(?, utm_source),
-                        utm_medium = COALESCE(?, utm_medium),
-                        utm_campaign = COALESCE(?, utm_campaign),
-                        utm_term = COALESCE(?, utm_term),
-                        utm_content = COALESCE(?, utm_content),
-                        last_interaction = CURRENT_TIMESTAMP
-                    WHERE telegram_id = ?
+                    INSERT INTO users 
+                    (telegram_id, username, full_name, utm_source, utm_medium, utm_campaign, utm_term, utm_content)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
+                    message.from_user.id,
+                    message.from_user.username,
+                    message.from_user.full_name,
                     utm.get('utm_source'),
                     utm.get('utm_medium'),
                     utm.get('utm_campaign'),
                     utm.get('utm_term'),
-                    utm.get('utm_content'),
-                    message.from_user.id
+                    utm.get('utm_content')
                 ))
-            await log_action(message.from_user.id, 'start_existing_user')
-        await db.commit()
+                await db.execute(
+                    'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                    (message.from_user.id, 'start_new_user')
+                )
+            else:
+                if utm:
+                    await db.execute('''
+                        UPDATE users SET
+                            utm_source = COALESCE(?, utm_source),
+                            utm_medium = COALESCE(?, utm_medium),
+                            utm_campaign = COALESCE(?, utm_campaign),
+                            utm_term = COALESCE(?, utm_term),
+                            utm_content = COALESCE(?, utm_content),
+                            last_interaction = CURRENT_TIMESTAMP
+                        WHERE telegram_id = ?
+                    ''', (
+                        utm.get('utm_source'),
+                        utm.get('utm_medium'),
+                        utm.get('utm_campaign'),
+                        utm.get('utm_term'),
+                        utm.get('utm_content'),
+                        message.from_user.id
+                    ))
+                await db.execute(
+                    'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                    (message.from_user.id, 'start_existing_user')
+                )
+            await db.commit()
 
     await message.answer(
         "Понимаю, проблемы с септиком — это неприятно. Поможем решить их быстро и с гарантией. 👷‍♂️\n"
@@ -249,7 +250,14 @@ async def cmd_start(message: Message, state: FSMContext):
 async def service_chosen(message: Message, state: FSMContext):
     service = message.text
     await state.update_data(service_type=service)
-    await log_action(message.from_user.id, f'chose_service:{service}')
+
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                (message.from_user.id, f'chose_service:{service}')
+            )
+            await db.commit()
 
     expert_text = (
         "🔍 Как понять, что пора откачивать септик?\n"
@@ -270,7 +278,14 @@ async def service_chosen(message: Message, state: FSMContext):
 async def address_entered(message: Message, state: FSMContext):
     address = message.text
     await state.update_data(address=address)
-    await log_action(message.from_user.id, f'entered_address:{address}')
+
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                (message.from_user.id, f'entered_address:{address}')
+            )
+            await db.commit()
 
     await message.answer(
         "Если знаете марку или тип септика (например, Танк, Топас, Юнилос), напишите. "
@@ -285,10 +300,18 @@ async def septic_type_entered(message: Message, state: FSMContext):
     septic = message.text
     if septic and septic not in ['/skip', '-']:
         await state.update_data(septic_type=septic)
-        await log_action(message.from_user.id, f'entered_septic:{septic}')
+        action = f'entered_septic:{septic}'
     else:
         await state.update_data(septic_type=None)
-        await log_action(message.from_user.id, 'skipped_septic')
+        action = 'skipped_septic'
+
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                (message.from_user.id, action)
+            )
+            await db.commit()
 
     # Демонстрация ценности
     pdf_path = "media/price.pdf"
@@ -343,37 +366,42 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     address = data.get('address')
     septic_type = data.get('septic_type')
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('SELECT id, utm_source, utm_medium, utm_campaign FROM users WHERE telegram_id = ?', (message.from_user.id,))
-        user = await cursor.fetchone()
-        if not user:
-            # Создаём пользователя, если его нет (на всякий случай)
-            await db.execute('''
-                INSERT INTO users (telegram_id, username, full_name, phone, address, septic_type)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (message.from_user.id, message.from_user.username, message.from_user.full_name, phone, address, septic_type))
-            await db.commit()
-            cursor = await db.execute('SELECT last_insert_rowid()')
-            user_id = (await cursor.fetchone())[0]
-            utm_source = utm_medium = utm_campaign = None
-        else:
-            user_id = user[0]
-            utm_source = user[1]
-            utm_medium = user[2]
-            utm_campaign = user[3]
-            # Обновляем данные пользователя
-            await db.execute('''
-                UPDATE users SET phone = ?, address = ?, septic_type = ?, last_interaction = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-            ''', (phone, address, septic_type, message.from_user.id))
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('SELECT id, utm_source, utm_medium, utm_campaign FROM users WHERE telegram_id = ?', (message.from_user.id,))
+            user = await cursor.fetchone()
+            if not user:
+                # Создаём пользователя, если его нет (на всякий случай)
+                await db.execute('''
+                    INSERT INTO users (telegram_id, username, full_name, phone, address, septic_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (message.from_user.id, message.from_user.username, message.from_user.full_name, phone, address, septic_type))
+                await db.commit()
+                cursor = await db.execute('SELECT last_insert_rowid()')
+                user_id = (await cursor.fetchone())[0]
+                utm_source = utm_medium = utm_campaign = None
+            else:
+                user_id = user[0]
+                utm_source = user[1]
+                utm_medium = user[2]
+                utm_campaign = user[3]
+                # Обновляем данные пользователя
+                await db.execute('''
+                    UPDATE users SET phone = ?, address = ?, septic_type = ?, last_interaction = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                ''', (phone, address, septic_type, message.from_user.id))
 
-        # Создаём заявку
-        await db.execute('''
-            INSERT INTO leads (user_id, service_type, address, septic_type, status)
-            VALUES (?, ?, ?, ?, 'новый')
-        ''', (user_id, service_type, address, septic_type))
-        await db.commit()
-        await log_action(message.from_user.id, f'lead_created:{service_type}')
+            # Создаём заявку
+            await db.execute('''
+                INSERT INTO leads (user_id, service_type, address, septic_type, status)
+                VALUES (?, ?, ?, ?, 'новый')
+            ''', (user_id, service_type, address, septic_type))
+            # Логируем
+            await db.execute(
+                'INSERT INTO logs (user_id, action) VALUES (?, ?)',
+                (message.from_user.id, f'lead_created:{service_type}')
+            )
+            await db.commit()
 
     lead_data = {
         'service_type': service_type,
@@ -385,7 +413,6 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     }
     await notify_manager(message.bot, lead_data)
 
-    # Финальное сообщение с возможностью начать новую заявку
     await message.answer(
         f"✅ Спасибо, {message.from_user.first_name}! Ваша заявка принята и передана менеджеру.\n"
         f"Данные сохранены в нашей системе. Менеджер свяжется с вами в течение 5-10 минут.",
@@ -393,7 +420,7 @@ async def process_phone(message: Message, state: FSMContext, phone: str):
     )
     await state.clear()
 
-# === Админские команды (без изменений) ===
+# === Админские команды (без изменений, но тоже используют db_lock) ===
 async def is_admin(message: Message) -> bool:
     return MANAGER_ID is not None and message.from_user.id == MANAGER_ID
 
@@ -404,24 +431,25 @@ async def cmd_stats(message: Message):
     today = datetime.utcnow().date()
     week_ago = today - timedelta(days=7)
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('SELECT COUNT(*) FROM users')
-        total_users = (await cursor.fetchone())[0]
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('SELECT COUNT(*) FROM users')
+            total_users = (await cursor.fetchone())[0]
 
-        cursor = await db.execute(
-            'SELECT COUNT(*) FROM leads WHERE date(created_at) = date(?)',
-            (today.isoformat(),)
-        )
-        leads_today = (await cursor.fetchone())[0]
+            cursor = await db.execute(
+                'SELECT COUNT(*) FROM leads WHERE date(created_at) = date(?)',
+                (today.isoformat(),)
+            )
+            leads_today = (await cursor.fetchone())[0]
 
-        cursor = await db.execute(
-            'SELECT COUNT(*) FROM leads WHERE created_at >= ?',
-            (week_ago.isoformat(),)
-        )
-        leads_week = (await cursor.fetchone())[0]
+            cursor = await db.execute(
+                'SELECT COUNT(*) FROM leads WHERE created_at >= ?',
+                (week_ago.isoformat(),)
+            )
+            leads_week = (await cursor.fetchone())[0]
 
-        cursor = await db.execute('SELECT COUNT(DISTINCT user_id) FROM leads')
-        users_with_leads = (await cursor.fetchone())[0]
+            cursor = await db.execute('SELECT COUNT(DISTINCT user_id) FROM leads')
+            users_with_leads = (await cursor.fetchone())[0]
 
     text = (
         f"📊 Статистика:\n"
@@ -436,12 +464,13 @@ async def cmd_stats(message: Message):
 async def cmd_get_leads(message: Message):
     if not await is_admin(message):
         return
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('''
-            SELECT id, service_type, status, created_at FROM leads
-            ORDER BY created_at DESC LIMIT 10
-        ''')
-        leads = await cursor.fetchall()
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT id, service_type, status, created_at FROM leads
+                ORDER BY created_at DESC LIMIT 10
+            ''')
+            leads = await cursor.fetchall()
 
     if not leads:
         await message.answer("Нет заявок.")
@@ -468,15 +497,16 @@ async def cmd_lead(message: Message, command: CommandObject):
         await message.answer("Неверный формат ID.")
         return
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('''
-            SELECT l.id, l.service_type, l.status, l.created_at, l.address, l.septic_type,
-                   u.full_name, u.username, u.phone, u.utm_source, u.utm_medium, u.utm_campaign
-            FROM leads l
-            JOIN users u ON l.user_id = u.id
-            WHERE l.id = ?
-        ''', (lead_id,))
-        lead = await cursor.fetchone()
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('''
+                SELECT l.id, l.service_type, l.status, l.created_at, l.address, l.septic_type,
+                       u.full_name, u.username, u.phone, u.utm_source, u.utm_medium, u.utm_campaign
+                FROM leads l
+                JOIN users u ON l.user_id = u.id
+                WHERE l.id = ?
+            ''', (lead_id,))
+            lead = await cursor.fetchone()
 
     if not lead:
         await message.answer("Заявка не найдена.")
@@ -529,9 +559,10 @@ async def broadcast_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     text = data.get('broadcast_text')
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute('SELECT telegram_id FROM users')
-        user_ids = [row[0] for row in await cursor.fetchall()]
+    async with db_lock:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cursor = await db.execute('SELECT telegram_id FROM users')
+            user_ids = [row[0] for row in await cursor.fetchall()]
 
     await callback.message.edit_text(f"Начинаю рассылку {len(user_ids)} пользователям...")
 
@@ -557,12 +588,12 @@ async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Рассылка отменена.")
     await state.clear()
 
-# === Запуск бота ===
+# === Запуск ===
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     if not API_TOKEN:
-        raise ValueError("Не задан API_TOKEN в переменных окружения")
+        raise ValueError("Не задан API_TOKEN")
     bot = Bot(token=API_TOKEN)
     await dp.start_polling(bot)
 
